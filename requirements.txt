@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+mcp>=1.10,<2
+openai
+requests
+python-dotenv
+pydantic
