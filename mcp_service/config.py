@@ -27,3 +27,7 @@ AGENT_MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", "10"))
 
 # Logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # DEBUG / INFO / WARNING / ERROR
+
+# LLM health watcher — how often (seconds) to re-probe the LLM endpoint.
+# Set to 0 to disable the watcher (not recommended in production).
+LLM_HEALTH_INTERVAL = int(os.getenv("LLM_HEALTH_INTERVAL", "30"))

@@ -1,11 +1,12 @@
+import asyncio
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 
 import config
 from agent import run_chat
-from llm.factory import get_provider, provider_kind
+from llm.factory import get_provider, provider_kind, start_health_watcher
 from logger import configure, get_logger, new_request_id
 from mcp_server import mcp
 from schemas import ChatRequest, ChatResponse
@@ -21,10 +22,24 @@ mcp_app = mcp.streamable_http_app()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    provider = get_provider()  # probe once at startup, not on the first /chat request
+    # Initialise provider synchronously at startup (blocking probe runs once
+    # before the server accepts any requests -- acceptable here).
+    get_provider()
     log.info("service_started", llm=provider_kind())
+
+    # Start background health watcher -- re-probes LLM every
+    # LLM_HEALTH_INTERVAL seconds and swaps provider if status changes.
+    watcher = asyncio.create_task(start_health_watcher())
+
     async with mcp.session_manager.run():
         yield
+
+    # Clean shutdown: cancel the watcher and wait for it to finish
+    watcher.cancel()
+    try:
+        await watcher
+    except asyncio.CancelledError:
+        pass
     log.info("service_stopped")
 
 
