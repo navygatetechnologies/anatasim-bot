@@ -1,6 +1,11 @@
+import time
+
 import requests
 
 import config
+from logger import get_logger
+
+log = get_logger(__name__)
 
 
 class ControllerError(Exception):
@@ -8,14 +13,32 @@ class ControllerError(Exception):
 
 
 def _request(method: str, url: str, **kwargs):
+    start = time.monotonic()
     response = requests.request(method, url, timeout=30, **kwargs)
-    print("MCP API:", method, url, response.status_code)
+    duration_ms = round((time.monotonic() - start) * 1000)
+
     if response.status_code >= 400:
         try:
             detail = response.json().get("detail", response.text)
         except Exception:
             detail = response.text
+        log.error(
+            "backend_error",
+            method=method,
+            url=url,
+            status=response.status_code,
+            detail=detail,
+            duration_ms=duration_ms,
+        )
         raise ControllerError(f"{response.status_code}: {detail}")
+
+    log.info(
+        "backend_request",
+        method=method,
+        url=url,
+        status=response.status_code,
+        duration_ms=duration_ms,
+    )
     return response.json()
 
 

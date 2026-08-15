@@ -1,11 +1,16 @@
 import json
+import time
+import traceback
 
 from mcp.shared.memory import create_connected_server_and_client_session
 
 import config
 from llm.factory import get_provider
+from logger import get_logger
 from mcp_server import mcp
 from schemas import ChatRequest, ChatResponse, PendingAction
+
+log = get_logger(__name__)
 
 SYSTEM_PROMPT = """You are the ANANTASIM simulation assistant. You help users modify OpenFOAM \
 simulation settings in natural language. In this demo you can change the velocity field (U) and \
@@ -51,29 +56,19 @@ question, and never pretend a tool exists that doesn't."""
 
 _APPLY_TOOLS = {"set_velocity", "apply_setting"}
 
-# Per-tool map from the tool's parameter name to the ChatRequest attribute
-# force-injected into it. Identities always come from the authenticated
-# request, never from the model -- see _inject_identities/_run_agent_loop
-# below. (The real service also has a _REQUIRED_FOR_TOOL/_missing_identities
-# mechanism for tools with optional identity params -- dropped here since
-# every identity these 4 tools use is a required ChatRequest field.)
 _TOOL_IDENTITIES = {
     "get_velocity_context": {"project_id": "project_id", "sim_id": "sim_id", "user_id": "user_id"},
-    "set_velocity": {"project_id": "project_id", "sim_id": "sim_id", "user_id": "user_id"},
-    "get_setting_context": {"project_id": "project_id", "sim_id": "sim_id", "user_id": "user_id"},
-    "apply_setting": {"project_id": "project_id", "sim_id": "sim_id", "user_id": "user_id"},
+    "set_velocity":         {"project_id": "project_id", "sim_id": "sim_id", "user_id": "user_id"},
+    "get_setting_context":  {"project_id": "project_id", "sim_id": "sim_id", "user_id": "user_id"},
+    "apply_setting":        {"project_id": "project_id", "sim_id": "sim_id", "user_id": "user_id"},
 }
 
-# Every parameter name any tool's identity map injects into -- used to strip
-# identities from a PendingAction before it's shown to the caller.
 _ALL_IDENTITY_PARAM_NAMES = {
     param for mapping in _TOOL_IDENTITIES.values() for param in mapping
 }
 
 
 def _inject_identities(tool_name: str, arguments: dict, request: ChatRequest) -> dict:
-    """Overwrite `arguments` with this tool's declared identity parameters,
-    read from the authenticated request -- never from the model."""
     mapping = _TOOL_IDENTITIES.get(tool_name, {})
     for param, attr in mapping.items():
         arguments[param] = getattr(request, attr)
@@ -81,10 +76,6 @@ def _inject_identities(tool_name: str, arguments: dict, request: ChatRequest) ->
 
 
 def _filtered_arguments(listed_tools, tool_name: str, arguments: dict) -> dict:
-    """Drop any argument key the tool doesn't actually declare in its schema
-    before identities are injected -- a model can put anything it likes in a
-    tool call's arguments, and forwarding an undeclared kwarg to a Python
-    function raises TypeError instead of a recoverable tool error."""
     for t in listed_tools.tools:
         if t.name == tool_name:
             allowed = set(t.inputSchema.get("properties", {}))
@@ -107,25 +98,58 @@ def _summarize_pending(name: str, arguments: dict) -> str:
 
 
 async def run_chat(request: ChatRequest) -> ChatResponse:
-    async with create_connected_server_and_client_session(mcp._mcp_server) as session:
-        if request.confirm:
-            return await _run_confirmed(session, request)
-        return await _run_agent_loop(session, request)
+    # Shared identity context attached to every log call in this function
+    ctx = dict(
+        user_id=request.user_id,
+        project_id=request.project_id,
+        sim_id=request.sim_id,
+    )
+    try:
+        async with create_connected_server_and_client_session(mcp._mcp_server) as session:
+            if request.confirm:
+                return await _run_confirmed(session, request, ctx)
+            return await _run_agent_loop(session, request, ctx)
+    except Exception as exc:
+        log.error(
+            "agent_unhandled_error",
+            error=str(exc),
+            traceback=traceback.format_exc(),
+            **ctx,
+        )
+        return ChatResponse(
+            message="An unexpected error occurred. Please try again.",
+            applied=False,
+        )
 
 
-async def _run_confirmed(session, request: ChatRequest) -> ChatResponse:
+async def _run_confirmed(session, request: ChatRequest, ctx: dict) -> ChatResponse:
     """The user clicked Confirm on a previously staged PendingAction --
-    execute it directly, without asking the model again. Deterministic: the
-    model's only role was proposing the change; whether it actually happens
-    from here on is entirely code-driven, not model-driven."""
+    execute it directly, without asking the model again."""
     pending = request.confirm
+
+    log.info(
+        "confirm_started",
+        tool=pending.tool,
+        arguments=pending.arguments,
+        **ctx,
+    )
+
     arguments = _filtered_arguments(await session.list_tools(), pending.tool, dict(pending.arguments))
     arguments = _inject_identities(pending.tool, arguments, request)
 
+    start = time.monotonic()
     result = await session.call_tool(pending.tool, arguments)
+    duration_ms = round((time.monotonic() - start) * 1000)
     text = _tool_result_text(result)
 
     if result.isError:
+        log.error(
+            "confirm_tool_error",
+            tool=pending.tool,
+            error=text,
+            duration_ms=duration_ms,
+            **ctx,
+        )
         return ChatResponse(message=f"I couldn't apply that: {text}", applied=False)
 
     try:
@@ -133,10 +157,16 @@ async def _run_confirmed(session, request: ChatRequest) -> ChatResponse:
     except json.JSONDecodeError:
         detail = {"raw": text}
 
+    log.info(
+        "confirm_completed",
+        tool=pending.tool,
+        duration_ms=duration_ms,
+        **ctx,
+    )
     return ChatResponse(message=f"Done — {pending.summary}", applied=True, detail=detail)
 
 
-async def _run_agent_loop(session, request: ChatRequest) -> ChatResponse:
+async def _run_agent_loop(session, request: ChatRequest, ctx: dict) -> ChatResponse:
     provider = get_provider()
 
     listed = await session.list_tools()
@@ -156,10 +186,27 @@ async def _run_agent_loop(session, request: ChatRequest) -> ChatResponse:
     messages += [{"role": m.role, "content": m.content} for m in request.history]
     messages.append({"role": "user", "content": request.message})
 
-    for _ in range(config.AGENT_MAX_TURNS):
-        reply = await provider.chat(messages, tools)
+    log.info("agent_loop_started", total_messages=len(messages), **ctx)
 
+    for turn in range(config.AGENT_MAX_TURNS):
+        # ---- LLM call ----
+        log.debug("llm_call_started", turn=turn, **ctx)
+        llm_start = time.monotonic()
+        reply = await provider.chat(messages, tools)
+        llm_duration_ms = round((time.monotonic() - llm_start) * 1000)
+
+        log.info(
+            "llm_call_completed",
+            turn=turn,
+            has_text=bool(reply.content),
+            tool_calls=[tc.name for tc in reply.tool_calls],
+            duration_ms=llm_duration_ms,
+            **ctx,
+        )
+
+        # Plain text answer — loop ends
         if not reply.tool_calls:
+            log.info("agent_loop_completed", turns_used=turn + 1, **ctx)
             return ChatResponse(message=reply.content or "", applied=False)
 
         messages.append({
@@ -179,20 +226,47 @@ async def _run_agent_loop(session, request: ChatRequest) -> ChatResponse:
             arguments = _filtered_arguments(listed, tc.name, dict(tc.arguments))
             arguments = _inject_identities(tc.name, arguments, request)
 
+            # ---- Mutating tool — stage it, never auto-execute ----
             if tc.name in _APPLY_TOOLS:
-                # Never auto-execute a mutating tool -- stage it and return
-                # immediately so the caller can show a real Confirm/Cancel
-                # prompt. The model never sees a result for this call (there
-                # isn't one yet), so it can't narrate a false "done".
+                visible_args = {k: v for k, v in arguments.items() if k not in _ALL_IDENTITY_PARAM_NAMES}
+                log.info(
+                    "tool_call_staged",
+                    tool=tc.name,
+                    arguments=visible_args,
+                    turn=turn,
+                    **ctx,
+                )
                 pending = PendingAction(
                     tool=tc.name,
-                    arguments={k: v for k, v in arguments.items() if k not in _ALL_IDENTITY_PARAM_NAMES},
+                    arguments=visible_args,
                     summary=_summarize_pending(tc.name, arguments),
                 )
                 return ChatResponse(message=pending.summary, applied=False, pending_action=pending)
 
+            # ---- Read tool — execute and feed result back to LLM ----
+            log.debug("tool_call_started", tool=tc.name, turn=turn, **ctx)
+            tool_start = time.monotonic()
             result = await session.call_tool(tc.name, arguments)
+            tool_duration_ms = round((time.monotonic() - tool_start) * 1000)
             text = _tool_result_text(result)
+
+            if result.isError:
+                log.error(
+                    "tool_call_error",
+                    tool=tc.name,
+                    error=text,
+                    duration_ms=tool_duration_ms,
+                    turn=turn,
+                    **ctx,
+                )
+            else:
+                log.info(
+                    "tool_call_completed",
+                    tool=tc.name,
+                    duration_ms=tool_duration_ms,
+                    turn=turn,
+                    **ctx,
+                )
 
             messages.append({
                 "role": "tool",
@@ -200,6 +274,13 @@ async def _run_agent_loop(session, request: ChatRequest) -> ChatResponse:
                 "content": text,
             })
 
+    # Exhausted all turns without a final answer — this is a WARNING because
+    # it means something went wrong in the LLM loop (stuck, confused, etc.)
+    log.warning(
+        "agent_max_turns_reached",
+        max_turns=config.AGENT_MAX_TURNS,
+        **ctx,
+    )
     return ChatResponse(
         message=(
             "I couldn't complete that request within the allowed number of steps. "

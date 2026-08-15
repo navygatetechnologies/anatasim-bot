@@ -24,3 +24,6 @@ WORKER_API_KEY = os.getenv("WORKER_API_KEY", "demo-worker-key")
 PREPROCESSOR_API_KEY = os.getenv("PREPROCESSOR_API_KEY", "demo-preprocessor-key")
 
 AGENT_MAX_TURNS = int(os.getenv("AGENT_MAX_TURNS", "10"))
+
+# Logging
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # DEBUG / INFO / WARNING / ERROR
