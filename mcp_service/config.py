@@ -31,3 +31,10 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")  # DEBUG / INFO / WARNING / ERROR
 # LLM health watcher — how often (seconds) to re-probe the LLM endpoint.
 # Set to 0 to disable the watcher (not recommended in production).
 LLM_HEALTH_INTERVAL = int(os.getenv("LLM_HEALTH_INTERVAL", "30"))
+
+# Rate limiting — per user_id sliding window.
+# RATE_LIMIT_RPM: max requests per minute (0 = disabled).
+# RATE_LIMIT_RPD: max requests per day (0 = disabled).
+# Confirm-only requests (no LLM call) are exempt from both limits.
+RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "20"))
+RATE_LIMIT_RPD = int(os.getenv("RATE_LIMIT_RPD", "200"))

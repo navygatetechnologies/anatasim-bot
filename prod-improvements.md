@@ -206,3 +206,142 @@ Run with:
 cd mcp_service
 python -m pytest tests/test_llm_factory.py -v
 ```
+
+---
+
+## 3. Per-User Rate Limiting
+
+### Problem
+
+Before this change, a single user could send unlimited requests to
+`/chat`. Every request:
+
+- Calls the LLM — costs money per token with a real model
+- Runs an agent loop for up to `AGENT_MAX_TURNS` turns
+- Hits the backend on each tool call
+
+A buggy frontend, an automated script, or a single bad actor could
+exhaust the LLM budget, slow down every other user, or overload the
+backend. There was no protection at any layer.
+
+This is the same problem Google Gemini solves at the infrastructure
+layer with their requests-per-minute and tokens-per-day limits. We solve
+it at the application layer — which means we control the logic, we can
+make it domain-aware (confirm flows are exempt), and every rejection is
+logged so you can see exactly who is hitting limits and why.
+
+### Solution
+
+A new file `mcp_service/rate_limiter.py` implements a **sliding window**
+rate limiter keyed by `user_id`, enforcing two independent limits:
+
+- **RPM (requests per minute)** — protects against burst abuse and
+  runaway frontends. Default: 20.
+- **RPD (requests per day)** — protects against LLM cost exhaustion
+  over a full working day. Default: 200.
+
+**Why sliding window and not fixed window?**
+
+A fixed window resets all at once — a user could send 20 requests at
+23:59, the window resets at 00:00, and they send 20 more immediately.
+That's 40 requests in 2 seconds. A sliding window tracks individual
+timestamps — the window moves continuously so the limit is always
+enforced over the last 60 real seconds, not the last calendar minute.
+
+**How it works:**
+
+Each user has a deque (double-ended queue) of request timestamps for
+each window. On every request:
+1. Timestamps older than the window size are dropped from the front
+2. If the remaining count equals or exceeds the limit → reject with
+   `RateLimitExceeded`, including a `retry_after` telling the user
+   exactly how long to wait
+3. Otherwise → record the timestamp and proceed
+
+**Confirm requests are exempt from both limits:**
+
+When a user confirms a `PendingAction` there is no LLM call and no
+agent loop — just a single tool execution. Blocking confirms would
+strand users mid-conversation with no way to proceed or cancel. Confirm
+requests also do not consume quota, so they cannot be used to game the
+limiter.
+
+**What a rejected request looks like:**
+
+The user receives a clean `ChatResponse` (not an HTTP error):
+```json
+{
+  "message": "You're sending requests too quickly. Please wait 42 seconds before trying again.",
+  "applied": false
+}
+```
+
+And the log captures the full context:
+```json
+{
+  "level": "warning",
+  "event": "rate_limit_exceeded",
+  "user_id": "u_123",
+  "project_id": "proj_xyz",
+  "window": "minute",
+  "limit": 20,
+  "retry_after_seconds": 42,
+  "rpm": 20,
+  "rpd": 87
+}
+```
+
+This log line is what you alert on. If one user is repeatedly hitting
+the limit, the `user_id` and `project_id` fields tell you exactly who
+and where.
+
+**New env vars:**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `RATE_LIMIT_RPM` | `20` | Max requests per minute per user. Set to `0` to disable. |
+| `RATE_LIMIT_RPD` | `200` | Max requests per day per user. Set to `0` to disable. |
+
+**Scale note:** the counter lives in memory in a single process. For a
+multi-instance deployment behind a load balancer, each instance tracks
+its own counter independently — the effective limit multiplies by the
+number of instances. For true global rate limiting at scale, replace the
+in-memory deque with a Redis sorted set. The `RateLimiter` interface
+does not change — only the storage backend.
+
+**Files changed:**
+- `mcp_service/rate_limiter.py` — new file, the full implementation
+- `mcp_service/main.py` — creates limiter singleton, checks before
+  `run_chat`, logs rejections
+- `mcp_service/config.py` — `RATE_LIMIT_RPM` and `RATE_LIMIT_RPD`
+  env vars
+
+**Tests:**
+- `mcp_service/tests/test_rate_limiter.py` — 16 tests covering RPM
+  and RPD blocking, sliding window eviction, confirm exemption, quota
+  not consumed by confirms, disabled limits, user isolation,
+  `retry_after` bounds, and `current_counts` accuracy
+
+Run with:
+```bash
+cd mcp_service
+python -m pytest tests/test_rate_limiter.py -v
+```
+
+---
+
+## Test Suite Summary
+
+All improvements are covered by automated tests. Run the full suite:
+
+```bash
+cd mcp_service
+python -m pytest tests/ -v
+```
+
+Current state: **22 tests, all passing.**
+
+| Test file | Tests | What it covers |
+|---|---|---|
+| `tests/test_llm_factory.py` | 6 | LLM provider health watcher fixes |
+| `tests/test_rate_limiter.py` | 16 | Rate limiter all scenarios |

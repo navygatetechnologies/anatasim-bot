@@ -9,6 +9,7 @@ from agent import run_chat
 from llm.factory import get_provider, provider_kind, start_health_watcher
 from logger import configure, get_logger, new_request_id
 from mcp_server import mcp
+from rate_limiter import RateLimiter, RateLimitExceeded
 from schemas import ChatRequest, ChatResponse
 
 # Configure logging before anything else runs
@@ -45,19 +46,47 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ANANTASIM chat demo -- mcp_service", lifespan=lifespan)
 
+# One limiter instance for the process lifetime, configured from env vars.
+# Confirm-only requests are exempt -- checked inside limiter.check().
+_limiter = RateLimiter(rpm=config.RATE_LIMIT_RPM, rpd=config.RATE_LIMIT_RPD)
+
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
     rid = new_request_id()  # bind a fresh request_id to this async context
+    is_confirm = request.confirm is not None
 
     log.info(
         "chat_request_received",
         user_id=request.user_id,
         project_id=request.project_id,
         sim_id=request.sim_id,
-        is_confirm=request.confirm is not None,
+        is_confirm=is_confirm,
         history_turns=len(request.history),
     )
+
+    # --- Rate limit check (confirms are exempt) ---
+    try:
+        _limiter.check(request.user_id, is_confirm=is_confirm)
+    except RateLimitExceeded as exc:
+        counts = _limiter.current_counts(request.user_id)
+        log.warning(
+            "rate_limit_exceeded",
+            user_id=request.user_id,
+            project_id=request.project_id,
+            window=exc.window,
+            limit=exc.limit,
+            retry_after_seconds=exc.retry_after,
+            rpm=counts["rpm"],
+            rpd=counts["rpd"],
+        )
+        return ChatResponse(
+            message=(
+                f"You're sending requests too quickly. "
+                f"Please wait {exc.retry_after} seconds before trying again."
+            ),
+            applied=False,
+        )
 
     start = time.monotonic()
     response = await run_chat(request)
